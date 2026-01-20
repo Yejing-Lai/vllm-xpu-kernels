@@ -2,7 +2,8 @@
 import pytest
 import torch
 
-from tests.ops.fp8_quant_op import scaled_fp8_quant
+from tests.ops.fp8_quant_op import scaled_fp8_quant, fp8_block_quant_2d, per_token_group_quant_fp8
+from tests.ops.mx_utils import from_blocked_format, to_mxfp
 from tests.register_ops import fp8_gemm, fp8_gemm_w8a16
 
 BATCHES = [1]
@@ -20,7 +21,22 @@ MINI_MNK_FACTORS = [
     (4, 32, 16),
 ]
 
-#override pytest parameters when enable mini pytest
+MX_MNK_FACTORS = [
+    (1, 32, 32),
+    (1, 64, 32),
+    (32, 32, 32),
+    (32, 64, 32),
+]
+
+GROUP_SIZE = [128, 256]
+MNK_BLOCK_FACTORS = [
+    (1, 256, 1024),
+    (4, 256, 1024),
+    (8, 256, 1024),
+    (8, 512, 1024),
+]
+
+# override pytest parameters when enable mini pytest
 MINI_PYTEST_PARAMS = {
     "test_fp8_gemm_w8a16": {
         "mnk_factors": MINI_MNK_FACTORS[:1],
@@ -168,3 +184,74 @@ def test_fp8_gemm_per_channel(fp8_dtype, dtype, is_nt, batch, mnk_factors):
     )
 
     torch.testing.assert_close(output_fp8, output_ref, atol=6e-2, rtol=6e-2)
+
+
+@pytest.mark.parametrize("fp8_dtype", [torch.float8_e4m3fn])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("is_nt", [True, False])
+@pytest.mark.parametrize("batch", BATCHES)
+@pytest.mark.parametrize("group_size", GROUP_SIZE)
+@pytest.mark.parametrize("mnk_factors", MNK_BLOCK_FACTORS)
+def test_fp8_gemm_per_block(fp8_dtype, dtype, is_nt, batch, group_size, mnk_factors):
+    seed = 27
+    torch.manual_seed(seed)
+
+    m, n, k = mnk_factors
+
+    input = torch.randn(
+        [batch * m, k], dtype=dtype, device=torch.device("xpu")) / 10.0
+    weight = torch.randn([n, k], dtype=dtype).xpu() / 10.0
+
+    input_fp8, scale_src_fp8 = per_token_group_quant_fp8(input.reshape(-1, k), group_size, dtype=torch.float8_e4m3fn, use_ue8m0=False)
+    weight_fp8, scale_wei_fp8 = fp8_block_quant_2d(weight, group_size, group_size)
+
+    # reference fp16 gemm
+    output_ref = torch.matmul(input, weight.t())
+
+    weight_fp8 = weight_fp8.transpose(0, 1)
+    if is_nt:
+        weight_fp8 = weight_fp8.contiguous()
+
+    output_fp8 = fp8_gemm(
+        input_fp8,
+        weight_fp8,
+        dtype,
+        scale_src_fp8,
+        scale_wei_fp8,
+        torch.Tensor(),
+    )
+
+    torch.testing.assert_close(output_fp8, output_ref, atol=6e-2, rtol=6e-2)
+
+
+def _convert_to_mxfp8_with_hp_ref(t):
+    # Convert a tensor to mxfp8, returning:
+    #   t_hp : reconstructed bf16 version of t_lp
+    #   t_lp : fp8_e4m3 tensor
+    #   t_scale: fp8_e8m0 block-wise scaling factors (non-swizzled)
+    t_scale, t_lp = to_mxfp(t, format="mxfp8")
+    t_hp = from_blocked_format(t_lp, t_scale, blocksize=32)
+
+    return t_hp, t_lp, t_scale
+
+
+@pytest.mark.parametrize("mnk_factors", MX_MNK_FACTORS)
+def test_mxfp8_gemm(mnk_factors):
+    m, n, k = mnk_factors
+    inputs = torch.randn((m, k), dtype=torch.bfloat16).xpu() * 0.01
+    weights = torch.randn((n, k), dtype=torch.bfloat16).xpu() * 0.01
+    inputs_hp, inputs_lp, inputs_scale = _convert_to_mxfp8_with_hp_ref(inputs)
+    weights_hp, weights_lp, weights_scale = _convert_to_mxfp8_with_hp_ref(
+        weights)
+
+    output = fp8_gemm(
+        inputs_lp,
+        weights_lp.transpose(0, 1),
+        torch.bfloat16,
+        inputs_scale,
+        weights_scale,
+        torch.Tensor(),
+    )
+
+    output_ref = torch.matmul(inputs_hp, weights_hp.t())
+    torch.testing.assert_close(output, output_ref, atol=5e-2, rtol=5e-2)

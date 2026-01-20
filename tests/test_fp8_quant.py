@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from tests.ops.fp8_quant_op import scaled_fp8_quant, per_token_group_quant_fp8
-from tests.ops.mx_utils import from_blocked_format, to_mxfp
+from tests.ops.mx_utils import to_mxfp
 
 SKIP_TEST_FOR_MINI_SCOPE = os.getenv("XPU_KERNEL_PYTEST_PROFILER") == "MINI"
 

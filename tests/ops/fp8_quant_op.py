@@ -11,6 +11,63 @@ import tests.register_ops as ops
 # sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))) #noqa: E501
 
 
+def fp8_block_quant_2d(
+    x: torch.Tensor,
+    block_m: int,
+    block_n: int,
+    fp8_dtype=torch.float8_e4m3fn,
+    eps: float = 1e-6,
+):
+    """
+    Reference FP8 2D block quantization
+
+    Args:
+        x: [M, N] float tensor (fp16/fp32)
+        block_m: block rows
+        block_n: block cols
+        fp8_dtype: torch.float8_e4m3fn or e5m2
+    Returns:
+        q: FP8 tensor [M, N]
+        scales: FP32 tensor [ceil(M/BM), ceil(N/BN)]
+    """
+    assert x.dim() == 2
+    assert fp8_dtype == torch.float8_e4m3fn
+    M, N = x.shape
+    device = x.device
+
+    assert M >= block_m and N >= block_n and M % block_m == 0 and N % block_n ==0
+    BM, BN = block_m, block_n
+    grid_m = (M + BM - 1) // BM
+    grid_n = (N + BN - 1) // BN
+
+    scales = torch.empty((grid_m, grid_n), device=device, dtype=torch.float32)
+    q = torch.empty_like(x, dtype=fp8_dtype)
+
+    FP8_MAX = 448
+
+    for gm in range(grid_m):
+        for gn in range(grid_n):
+            m0 = gm * BM
+            n0 = gn * BN
+            m1 = min(m0 + BM, M)
+            n1 = min(n0 + BN, N)
+
+            block = x[m0:m1, n0:n1]
+
+            # absmax
+            amax = block.abs().max()
+            scale = amax / FP8_MAX
+            scale = torch.clamp(scale, min=eps)
+
+            scales[gm, gn] = scale
+
+            # quantize
+            q_block = (block / scale).to(fp8_dtype)
+            q[m0:m1, n0:n1] = q_block
+
+    return q, scales
+
+
 def scaled_fp8_quant(
     input: torch.Tensor,
     scale: Optional[torch.Tensor] = None,
@@ -78,7 +135,6 @@ def per_token_group_quant_fp8(
     group_size: int,
     eps: float = 1e-10,
     dtype: torch.dtype | None = None,
-    column_major_scales: bool = False,
     out_q: torch.Tensor | None = None,
     use_ue8m0: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -91,7 +147,6 @@ def per_token_group_quant_fp8(
         eps: The minimum to avoid dividing zero.
         dtype: The dype of output tensor. Note that only `torch.float8_e4m3fn`
         is supported for now.
-        column_major_scales: Outputs scales in column major.
         out_q: Optional output tensor. If not provided, function will create.
     Returns:
         tuple[torch.Tensor, torch.Tensor]: The quantized tensor and the
@@ -105,22 +160,13 @@ def per_token_group_quant_fp8(
     )
     assert x.stride(-1) == 1, "`x` groups must be contiguous"
 
-    finfo = torch.finfo(dtype)
-    fp8_min = finfo.min
-    fp8_max = finfo.max
-
     assert out_q is None or out_q.shape == x.shape
     x_q = out_q
     if x_q is None:
         x_q = torch.empty_like(x, device=x.device, dtype=dtype)
 
-    # Allocate the scale tensor in either row- or column-major format.
-    if column_major_scales:
-        shape = (x.shape[-1] // group_size,) + x.shape[:-1]
-        x_s = torch.empty(shape, device=x.device, dtype=torch.float32).permute(-1, -2)
-    else:
-        shape = x.shape[:-1] + (x.shape[-1] // group_size,)
-        x_s = torch.empty(shape, device=x.device, dtype=torch.float32)
+    shape = x.shape[:-1] + (x.shape[-1] // group_size,)
+    x_s = torch.empty(shape, device=x.device, dtype=torch.float32)
 
     # TODO(bnell): this causes some fp8 moe test to fail.
     torch.ops._C.per_token_group_fp8_quant(

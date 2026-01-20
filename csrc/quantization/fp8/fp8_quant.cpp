@@ -78,7 +78,7 @@ class per_token_group_quant_8bit_kernel {
     int local_group_id = local_id / threads_per_group;
     int lane_id = local_id % threads_per_group;
 
-    // Global 16-thread group
+    // Global 32-thread group
     int block_group_id = item.get_group(0) * groups_per_block;
     int global_group_id = block_group_id + local_group_id;
 
@@ -94,7 +94,6 @@ class per_token_group_quant_8bit_kernel {
 
     bool const can_vectorize = group_size % 4 == 0;
 
-    //TODO: check this vec path
     if (can_vectorize) {
       local_absmax = thread_max_vec(
           group_input, group_size, lane_id, threads_per_group);
@@ -335,10 +334,6 @@ void per_token_group_fp8_quant(
   const int num_blocks = num_groups / groups_per_block;
   const int num_threads = groups_per_block * THREADS_PER_GROUP;
 
-  const bool is_column_major = output_s.stride(0) < output_s.stride(1);
-  const int scale_num_rows = output_s.size(1);
-  const int scale_stride = output_s.stride(1);
-
   sycl::range<1> grid(num_blocks);
   sycl::range<1> block(num_threads);
   auto& queue = vllm::xpu::vllmGetQueue();
@@ -366,8 +361,7 @@ void per_token_group_fp8_quant(
                             scale_ue8m0);
                     cgh.parallel_for(
                         sycl::nd_range<1>(grid * block, block), kernel);
-                  })
-                  .wait();
+                  });
             });
       });
 }
@@ -412,8 +406,7 @@ void dynamic_per_token_scaled_fp8_quant(
                             hidden_size);
                     cgh.parallel_for(
                         sycl::nd_range<1>(grid * block, block), kernel);
-                  })
-                  .wait();
+                  });
             });
       });
 }
